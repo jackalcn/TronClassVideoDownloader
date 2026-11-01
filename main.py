@@ -7,6 +7,7 @@ import shutil
 import sys
 import time
 import subprocess
+import tempfile
 import zipfile
 from io import BytesIO
 from datetime import datetime
@@ -364,12 +365,10 @@ def resolve_vimeo_and_cookies(
     username: str,
     password: str,
     video_page_url: str,
-    output_dir: Path,
+    cookie_file: Path,
     headless: bool,
     status_ui: StatusUI,
-) -> tuple[str, Path]:
-    cookies_file = output_dir / "tronclass_cookies.txt"
-
+) -> str:
     with sync_playwright() as playwright:
         browser = launch_chromium_with_bootstrap(playwright, headless=headless, status_ui=status_ui)
         context = browser.new_context()
@@ -402,11 +401,16 @@ def resolve_vimeo_and_cookies(
             raise RuntimeError("找不到 Vimeo 播放器連結。請確認頁面可播放，且影片不是 DRM 保護內容。")
 
         status_ui.info("3/4 匯出登入 cookies")
-        write_netscape_cookie_file(context.cookies(), cookies_file)
+        write_netscape_cookie_file(context.cookies(), cookie_file)
 
         browser.close()
 
-    return vimeo_url, cookies_file
+    return vimeo_url
+
+
+def private_cookie_dir() -> tempfile.TemporaryDirectory[str]:
+    # Login cookies stay private to one run: the folder is unique, owner-only and removed when the run ends.
+    return tempfile.TemporaryDirectory(prefix="videocap-cookies-", ignore_cleanup_errors=True)
 
 
 def is_missing_playwright_executable_error(exc: Exception) -> bool:
@@ -591,31 +595,33 @@ def run_download(
     status_ui: StatusUI,
     progress_ui: ProgressUI,
 ) -> tuple[Path, bool, bool, SubtitleDebugReport]:
-    vimeo_url, cookies_file = resolve_vimeo_and_cookies(
-        login_url=login_url,
-        username=username,
-        password=password,
-        video_page_url=video_page_url,
-        output_dir=output_dir,
-        headless=headless,
-        status_ui=status_ui,
-    )
+    with private_cookie_dir() as cookie_dir:
+        cookie_file = Path(cookie_dir) / "cookies.txt"
+        vimeo_url = resolve_vimeo_and_cookies(
+            login_url=login_url,
+            username=username,
+            password=password,
+            video_page_url=video_page_url,
+            cookie_file=cookie_file,
+            headless=headless,
+            status_ui=status_ui,
+        )
 
-    status_ui.info("4/4 使用 yt-dlp 下載 Vimeo 影片")
-    return download_with_ytdlp(
-        vimeo_url=vimeo_url,
-        output_dir=output_dir,
-        output_template=output_template,
-        cookie_file=cookies_file,
-        referer_url=video_page_url,
-        download_subtitles=download_subtitles,
-        subtitle_languages=subtitle_languages,
-        subtitle_format=subtitle_format,
-        embed_subtitles=embed_subtitles,
-        subtitle_debug_mode=subtitle_debug_mode,
-        retry_count=retry_count,
-        progress_ui=progress_ui,
-    )
+        status_ui.info("4/4 使用 yt-dlp 下載 Vimeo 影片")
+        return download_with_ytdlp(
+            vimeo_url=vimeo_url,
+            output_dir=output_dir,
+            output_template=output_template,
+            cookie_file=cookie_file,
+            referer_url=video_page_url,
+            download_subtitles=download_subtitles,
+            subtitle_languages=subtitle_languages,
+            subtitle_format=subtitle_format,
+            embed_subtitles=embed_subtitles,
+            subtitle_debug_mode=subtitle_debug_mode,
+            retry_count=retry_count,
+            progress_ui=progress_ui,
+        )
 
 
 def run_subtitle_inspection(
@@ -623,28 +629,29 @@ def run_subtitle_inspection(
     username: str,
     password: str,
     video_page_url: str,
-    output_dir: Path,
     headless: bool,
     retry_count: int,
     status_ui: StatusUI,
 ) -> tuple[str, SubtitleDebugReport]:
-    vimeo_url, cookies_file = resolve_vimeo_and_cookies(
-        login_url=login_url,
-        username=username,
-        password=password,
-        video_page_url=video_page_url,
-        output_dir=output_dir,
-        headless=headless,
-        status_ui=status_ui,
-    )
+    with private_cookie_dir() as cookie_dir:
+        cookie_file = Path(cookie_dir) / "cookies.txt"
+        vimeo_url = resolve_vimeo_and_cookies(
+            login_url=login_url,
+            username=username,
+            password=password,
+            video_page_url=video_page_url,
+            cookie_file=cookie_file,
+            headless=headless,
+            status_ui=status_ui,
+        )
 
-    status_ui.info("4/4 只檢查字幕軌 (不下載影片)")
-    debug_report = inspect_subtitle_tracks(
-        vimeo_url=vimeo_url,
-        cookie_file=cookies_file,
-        referer_url=video_page_url,
-        retry_count=retry_count,
-    )
+        status_ui.info("4/4 只檢查字幕軌 (不下載影片)")
+        debug_report = inspect_subtitle_tracks(
+            vimeo_url=vimeo_url,
+            cookie_file=cookie_file,
+            referer_url=video_page_url,
+            retry_count=retry_count,
+        )
     return vimeo_url, debug_report
 
 
@@ -1438,7 +1445,6 @@ def main() -> None:
                     username=username.strip(),
                     password=password,
                     video_page_url=video_page_url.strip(),
-                    output_dir=output_dir,
                     headless=headless,
                     retry_count=retry_count,
                     status_ui=status_ui,
