@@ -10,6 +10,7 @@ import subprocess
 import zipfile
 from io import BytesIO
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 from typing import Any, Iterable, Optional, Protocol, TypedDict, cast
 from urllib.parse import urljoin
@@ -148,9 +149,9 @@ def normalize_url(src: str, base_url: str) -> str:
 
 def find_vimeo_player_url(page: Page, timeout_ms: int = 25000) -> Optional[str]:
     patterns = (
-        r"https?://player\\.vimeo\\.com/video/\\d+[^\"'\\s<]*",
-        r"//player\\.vimeo\\.com/video/\\d+[^\"'\\s<]*",
-        r"https?://vimeo\\.com/\\d+",
+        r"https?://player\.vimeo\.com/video/\d+[^\"'\\\s<]*",
+        r"//player\.vimeo\.com/video/\d+[^\"'\\\s<]*",
+        r"https?://vimeo\.com/\d+",
     )
 
     deadline = time.time() + max(timeout_ms, 1000) / 1000.0
@@ -164,28 +165,29 @@ def find_vimeo_player_url(page: Page, timeout_ms: int = 25000) -> Optional[str]:
 
         for frame in page.frames:
             frame_url = (frame.url or "").strip()
-            if "player.vimeo.com/video/" in frame_url or re.search(r"https?://vimeo\\.com/\\d+", frame_url):
+            if "player.vimeo.com/video/" in frame_url or re.search(r"https?://vimeo\.com/\d+", frame_url):
                 return normalize_url(frame_url, page.url)
 
-        html_sources: list[str] = []
-        try:
-            html_sources.append(page.content())
-        except Exception:
-            pass
-
-        for frame in page.frames:
-            try:
-                html_sources.append(frame.content())
-            except Exception:
-                continue
-
-        for html in html_sources:
-            for pattern in patterns:
-                match = re.search(pattern, html)
-                if match:
-                    return normalize_url(match.group(0), page.url)
-
         page.wait_for_timeout(1000)
+
+    # Page text can mention unrelated videos, so only search it once no player frame has appeared.
+    html_sources: list[str] = []
+    try:
+        html_sources.append(unescape(page.content()))
+    except Exception:
+        pass
+
+    for frame in page.frames:
+        try:
+            html_sources.append(unescape(frame.content()))
+        except Exception:
+            continue
+
+    for pattern in patterns:
+        for html in html_sources:
+            match = re.search(pattern, html)
+            if match:
+                return normalize_url(match.group(0), page.url)
 
     return None
 
@@ -532,10 +534,14 @@ def download_with_ytdlp(
         ydl_opts["writeautomaticsub"] = True
         ydl_opts["subtitleslangs"] = subtitle_languages
         ydl_opts["subtitlesformat"] = subtitle_format
+        postprocessors: list[dict[str, Any]] = []
         if ffmpeg_available and subtitle_format in {"srt", "vtt"}:
-            ydl_opts["convertsubtitles"] = subtitle_format
+            postprocessors.append({"key": "FFmpegSubtitlesConvertor", "format": subtitle_format, "when": "before_dl"})
         if ffmpeg_available and embed_subtitles:
-            ydl_opts["embedsubtitles"] = True
+            # Keep the subtitle files after embedding so they can still be downloaded separately.
+            postprocessors.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": True})
+        if postprocessors:
+            ydl_opts["postprocessors"] = postprocessors
 
     if subtitle_debug_mode:
         try:

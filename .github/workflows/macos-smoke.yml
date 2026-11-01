@@ -96,8 +96,7 @@ jobs:
               assert output_path.name == "dummy.mp4", output_path
               assert captured.get("format") == "best", captured
               assert "merge_output_format" not in captured, captured
-              assert "embedsubtitles" not in captured, captured
-              assert "convertsubtitles" not in captured, captured
+              assert "postprocessors" not in captured, captured
               print("macOS fallback smoke passed")
           finally:
               main.get_ffmpeg_status = orig_status
