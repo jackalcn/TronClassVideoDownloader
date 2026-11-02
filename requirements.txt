@@ -1,4 +1,6 @@
-streamlit
+# 1.59 and later lose a password when the user presses Tab: focus lands on the show-password toggle and the value is never saved.
+streamlit==1.57.0
+# Newer Starlette (seen with 1.10.0) breaks Streamlit 1.57's download responses: "Expected ASGI message 'http.response.start'".
+starlette==1.0.0
 playwright
 yt-dlp
-beautifulsoup4

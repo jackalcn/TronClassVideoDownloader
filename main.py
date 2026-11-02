@@ -9,7 +9,6 @@ import time
 import subprocess
 import tempfile
 import zipfile
-from io import BytesIO
 from datetime import datetime
 from html import unescape
 from pathlib import Path
@@ -19,6 +18,7 @@ from urllib.parse import urljoin
 import streamlit as st
 import streamlit.components.v1 as components
 import yt_dlp
+from yt_dlp.utils import DownloadError, PostProcessingError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import Browser, Page, Playwright, sync_playwright
 
@@ -47,10 +47,14 @@ SUBMIT_SELECTORS = (
     'button:has-text("Sign in")',
 )
 
-APP_VERSION = "v2026.06.01.1"
-APP_UPDATED_AT = "2026-06-01"
+APP_VERSION = "v2026.11.03.1"
+APP_UPDATED_AT = "2026-11-03"
 DEPLOY_VERIFY_MIN_COMMIT = "7f71b98"
-DEPLOY_MARKER = "build-2026-06-01-01-mac-fallback"
+DEPLOY_MARKER = "build-2026-11-03-01-new-repo"
+
+COOKIE_DIR_PREFIX = "videocap-cookies-"
+CLOUD_DOWNLOAD_DIR_PREFIX = "videocap-downloads-"
+STALE_RUN_FOLDER_SECONDS = 6 * 60 * 60
 
 SUBTITLE_EXTENSIONS = {
     ".srt",
@@ -148,11 +152,21 @@ def normalize_url(src: str, base_url: str) -> str:
     return urljoin(base_url, src)
 
 
+def to_player_url(url: str) -> str:
+    # yt-dlp needs a Vimeo login for vimeo.com/<id> pages, while the player page only needs the Referer.
+    match = re.fullmatch(r"https?://(?:www\.)?vimeo\.com/(\d+)(?:/([\da-f]{10}))?/?(?:[?#].*)?", url)
+    if not match:
+        return url
+    video_id, unlisted_hash = match.groups()
+    query = f"?h={unlisted_hash}" if unlisted_hash else ""
+    return f"https://player.vimeo.com/video/{video_id}{query}"
+
+
 def find_vimeo_player_url(page: Page, timeout_ms: int = 25000) -> Optional[str]:
     patterns = (
         r"https?://player\.vimeo\.com/video/\d+[^\"'\\\s<]*",
         r"//player\.vimeo\.com/video/\d+[^\"'\\\s<]*",
-        r"https?://vimeo\.com/\d+",
+        r"https?://(?:www\.)?vimeo\.com/\d+(?:/[\da-f]{10})?",
     )
 
     deadline = time.time() + max(timeout_ms, 1000) / 1000.0
@@ -166,8 +180,8 @@ def find_vimeo_player_url(page: Page, timeout_ms: int = 25000) -> Optional[str]:
 
         for frame in page.frames:
             frame_url = (frame.url or "").strip()
-            if "player.vimeo.com/video/" in frame_url or re.search(r"https?://vimeo\.com/\d+", frame_url):
-                return normalize_url(frame_url, page.url)
+            if "player.vimeo.com/video/" in frame_url or re.search(r"https?://(?:www\.)?vimeo\.com/\d+", frame_url):
+                return to_player_url(normalize_url(frame_url, page.url))
 
         page.wait_for_timeout(1000)
 
@@ -188,7 +202,7 @@ def find_vimeo_player_url(page: Page, timeout_ms: int = 25000) -> Optional[str]:
         for html in html_sources:
             match = re.search(pattern, html)
             if match:
-                return normalize_url(match.group(0), page.url)
+                return to_player_url(normalize_url(match.group(0), page.url))
 
     return None
 
@@ -296,10 +310,17 @@ def render_copy_languages_widget(languages: list[str]) -> None:
     )
 
 
+def select_format() -> str:
+    # Without ffmpeg separate video and audio cannot be merged, so only a single combined file will do.
+    return "bestvideo+bestaudio/best" if get_ffmpeg_status()[0] else "best"
+
+
 def inspect_subtitle_tracks(vimeo_url: str, cookie_file: Path, referer_url: str, retry_count: int) -> SubtitleDebugReport:
     opts: dict[str, Any] = {
         "cookiefile": str(cookie_file),
+        "format": select_format(),
         "skip_download": True,
+        "color": "no_color",
         "quiet": True,
         "no_warnings": True,
         "retries": retry_count,
@@ -410,7 +431,20 @@ def resolve_vimeo_and_cookies(
 
 def private_cookie_dir() -> tempfile.TemporaryDirectory[str]:
     # Login cookies stay private to one run: the folder is unique, owner-only and removed when the run ends.
-    return tempfile.TemporaryDirectory(prefix="videocap-cookies-", ignore_cleanup_errors=True)
+    return tempfile.TemporaryDirectory(prefix=COOKIE_DIR_PREFIX, ignore_cleanup_errors=True)
+
+
+def remove_stale_run_folders() -> None:
+    # A killed process cannot clean up and Streamlit has no session-end hook, so each run sweeps what earlier ones left.
+    cutoff = time.time() - STALE_RUN_FOLDER_SECONDS
+    temp_root = Path(tempfile.gettempdir())
+    for prefix in (COOKIE_DIR_PREFIX, CLOUD_DOWNLOAD_DIR_PREFIX):
+        for folder in temp_root.glob(f"{prefix}*"):
+            try:
+                if folder.stat().st_mtime < cutoff:
+                    shutil.rmtree(folder, ignore_errors=True)
+            except OSError:
+                continue
 
 
 def is_missing_playwright_executable_error(exc: Exception) -> bool:
@@ -489,11 +523,10 @@ def download_with_ytdlp(
     subtitle_debug_mode: bool,
     retry_count: int,
     progress_ui: ProgressUI,
-) -> tuple[Path, bool, bool, SubtitleDebugReport]:
+) -> tuple[Path, bool, bool, SubtitleDebugReport, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_available, _ = get_ffmpeg_status()
 
-    result: dict[str, str] = {}
     subtitle_debug_report: SubtitleDebugReport = {
         "title": "",
         "extractor": "",
@@ -520,8 +553,9 @@ def download_with_ytdlp(
     ydl_opts: dict[str, Any] = {
         "outtmpl": str(output_dir / output_template),
         "cookiefile": str(cookie_file),
-        "format": "bestvideo+bestaudio/best" if ffmpeg_available else "best",
+        "format": select_format(),
         "noplaylist": True,
+        "color": "no_color",
         "quiet": True,
         "no_warnings": True,
         "retries": retry_count,
@@ -558,24 +592,54 @@ def download_with_ytdlp(
         except Exception as exc:
             subtitle_debug_report["inspection_error"] = str(exc)
 
-    with yt_dlp.YoutubeDL(cast(Any, ydl_opts)) as ydl:
-        info = cast(dict[str, Any], ydl.extract_info(vimeo_url, download=True))
-        filename = str(ydl.prepare_filename(cast(Any, info)))
-        has_available_subs = bool(info.get("subtitles") or info.get("automatic_captions"))
-        has_requested_subs = bool(info.get("requested_subtitles"))
+    def fetch(options: dict[str, Any]) -> tuple[Path, bool, bool, bool]:
+        with yt_dlp.YoutubeDL(cast(Any, options)) as ydl:
+            info = cast(dict[str, Any], ydl.extract_info(vimeo_url, download=True))
+            filename = str(ydl.prepare_filename(cast(Any, info)))
+            has_available_subs = bool(info.get("subtitles") or info.get("automatic_captions"))
+            has_requested_subs = bool(info.get("requested_subtitles"))
+            reused_existing_file = False
 
-        requested = info.get("requested_downloads")
-        if requested and isinstance(requested, list):
-            requested_items = cast(list[object], requested)
-            if requested_items and isinstance(requested_items[0], Mapping):
-                first_request = cast(Mapping[str, object], requested_items[0])
-                filepath = first_request.get("filepath")
-                if isinstance(filepath, str) and filepath:
-                    filename = filepath
+            requested = info.get("requested_downloads")
+            if requested and isinstance(requested, list):
+                requested_items = cast(list[object], requested)
+                if requested_items and isinstance(requested_items[0], Mapping):
+                    first_request = cast(Mapping[str, object], requested_items[0])
+                    filepath = first_request.get("filepath")
+                    if isinstance(filepath, str) and filepath:
+                        filename = filepath
+                    reused_existing_file = first_request.get("__real_download") is False
 
-        result["path"] = filename
+            return Path(filename).resolve(), has_available_subs, has_requested_subs, reused_existing_file
 
-    return Path(result["path"]).resolve(), has_available_subs, has_requested_subs, subtitle_debug_report
+    download_warning = ""
+    try:
+        output_path, has_available_subs, has_requested_subs, reused_existing_file = fetch(ydl_opts)
+        if reused_existing_file:
+            download_warning = "下載資料夾已有同名檔案，這次沒有重新下載。如果這是另一支影片，請換資料夾或改用自訂檔名。"
+    except DownloadError as exc:
+        # A bad subtitle should not cost the user the video, so retry with less subtitle work.
+        retry_opts = {key: value for key, value in ydl_opts.items() if key != "postprocessors"}
+        failed_step = exc.exc_info[1] if exc.exc_info else None
+        if "Unable to download video subtitles" in str(exc):
+            retry_opts.update(writesubtitles=False, writeautomaticsub=False)
+            download_warning = f"影片已下載，但有字幕檔下載失敗，字幕可能不完整：{exc}"
+        elif "postprocessors" in ydl_opts and isinstance(failed_step, PostProcessingError):
+            download_warning = f"影片已下載，但字幕轉檔或嵌入失敗，字幕只以原始格式另存：{exc}"
+        else:
+            raise
+        output_path, has_available_subs, has_requested_subs, _ = fetch(retry_opts)
+
+    return output_path, has_available_subs, has_requested_subs, subtitle_debug_report, download_warning
+
+
+def describe_download_error(exc: Exception, ffmpeg_available: bool) -> str:
+    message = str(exc)
+    if "DRM protected" in message:
+        return "這支影片受 DRM 保護，無法下載。"
+    if not ffmpeg_available and "Requested format is not available" in message:
+        return "這支影片沒有影音合一的格式，需要 ffmpeg 才能下載，請安裝後再試。若裝了 ffmpeg 仍失敗，影片可能受 DRM 保護。"
+    return message
 
 
 def run_download(
@@ -594,7 +658,7 @@ def run_download(
     retry_count: int,
     status_ui: StatusUI,
     progress_ui: ProgressUI,
-) -> tuple[Path, bool, bool, SubtitleDebugReport]:
+) -> tuple[Path, bool, bool, SubtitleDebugReport, str]:
     with private_cookie_dir() as cookie_dir:
         cookie_file = Path(cookie_dir) / "cookies.txt"
         vimeo_url = resolve_vimeo_and_cookies(
@@ -688,24 +752,6 @@ def is_streamlit_cloud_environment() -> bool:
     return cwd_text.startswith("/mount/src")
 
 
-def get_server_output_presets() -> list[str]:
-    candidates = [
-        (Path.cwd() / "downloads").resolve(),
-        Path.cwd().resolve(),
-        Path("/tmp/videocap-downloads"),
-        Path("/tmp"),
-    ]
-
-    unique: list[str] = []
-    seen: set[str] = set()
-    for path in candidates:
-        text = str(path)
-        if text not in seen:
-            seen.add(text)
-            unique.append(text)
-    return unique
-
-
 def detect_runtime_commit_short() -> str:
     env_keys = [
         "SOURCE_COMMIT",
@@ -737,6 +783,18 @@ def detect_runtime_commit_short() -> str:
     return DEPLOY_VERIFY_MIN_COMMIT
 
 
+def new_cloud_output_dir() -> Path:
+    # Cloud users share one server, so every download gets its own folder and same-named videos never meet.
+    return Path(tempfile.mkdtemp(prefix=CLOUD_DOWNLOAD_DIR_PREFIX)).resolve()
+
+
+def remove_cloud_output_dir(output_file: str) -> None:
+    # The page only offers the newest download, so older ones would just fill the shared server's disk.
+    folder = Path(output_file).parent
+    if folder.name.startswith(CLOUD_DOWNLOAD_DIR_PREFIX):
+        shutil.rmtree(folder, ignore_errors=True)
+
+
 def collect_video_and_subtitle_files(video_file: Path) -> list[Path]:
     if not video_file.exists():
         return []
@@ -748,7 +806,7 @@ def collect_video_and_subtitle_files(video_file: Path) -> list[Path]:
     for candidate in directory.iterdir():
         if not candidate.is_file() or candidate == video_file:
             continue
-        if candidate.suffix.lower() not in SUBTITLE_EXTENSIONS:
+        if candidate.suffix.lower() not in SUBTITLE_EXTENSIONS or candidate.stat().st_size == 0:
             continue
 
         candidate_name = candidate.name
@@ -759,40 +817,14 @@ def collect_video_and_subtitle_files(video_file: Path) -> list[Path]:
     return files
 
 
-def build_video_subtitle_zip(video_file: Path) -> tuple[Optional[bytes], str, list[str]]:
-    files = collect_video_and_subtitle_files(video_file)
-    if not files:
-        return None, "", []
-
-    zip_name = f"{video_file.stem}_bundle.zip"
-    buffer = BytesIO()
-    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as bundle:
-        for path in files:
-            bundle.write(path, arcname=path.name)
-
-    subtitle_names = [path.name for path in files if path != video_file]
-    return buffer.getvalue(), zip_name, subtitle_names
-
-
-def select_output_directory(initial_dir: str) -> tuple[Optional[str], Optional[str]]:
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except Exception as exc:
-        return None, f"無法開啟資料夾選擇器：{exc}"
-
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        cast(Any, root).attributes("-topmost", True)
-        selected = filedialog.askdirectory(initialdir=initial_dir or str(Path.cwd()))
-        root.destroy()
-    except Exception as exc:
-        return None, f"開啟資料夾選擇器失敗：{exc}"
-
-    if selected:
-        return selected, None
-    return None, None
+def build_video_subtitle_zip(files: list[Path]) -> bytes:
+    # Video does not compress further, so store it, and spool on disk so memory only ever holds one copy.
+    with tempfile.TemporaryFile() as spool:
+        with zipfile.ZipFile(spool, mode="w") as bundle:
+            for path in files:
+                bundle.write(path, arcname=path.name)
+        spool.seek(0)
+        return spool.read()
 
 
 def append_task_log(message: str) -> None:
@@ -979,20 +1011,6 @@ def apply_custom_style() -> None:
                     grid-template-columns: 1fr;
                 }
             }
-            .step-box {
-                border-left: 4px solid #0a7b88;
-                background: #f8fbfd;
-                border-radius: 10px;
-                padding: 14px 16px;
-                min-height: 64px;
-                color: #35465d;
-                box-shadow: 0 8px 24px rgba(11, 36, 71, 0.05);
-            }
-            .step-box.active {
-                background: #e8f6f8;
-                border-left-color: #0b5f6c;
-                color: #0d4f59;
-            }
             .status-card {
                 background: #ffffff;
                 border: 1px solid #deebf3;
@@ -1069,17 +1087,6 @@ def apply_custom_style() -> None:
     )
 
 
-def render_workflow_steps(active_step: int) -> None:
-    labels = ["解析連結", "下載影片", "處理字幕", "完成交付"]
-    cols = st.columns(4)
-    for idx, label in enumerate(labels, start=1):
-        css_class = "step-box active" if idx == active_step else "step-box"
-        cols[idx - 1].markdown(
-            f"<div class='{css_class}'><strong>{idx}. {label}</strong></div>",
-            unsafe_allow_html=True,
-        )
-
-
 def render_meta_badges(
     version: str,
     updated_at: str,
@@ -1154,34 +1161,25 @@ def render_final_download_actions(output_file: Path, is_cloud: bool) -> None:
         st.warning("找不到影片檔，請重試下載。")
         return
 
-    zip_data, zip_name, subtitle_names = build_video_subtitle_zip(output_file)
     bundled_files = collect_video_and_subtitle_files(output_file)
     subtitle_files = [path for path in bundled_files if path != output_file]
     key_base = re.sub(r"[^A-Za-z0-9_]+", "_", output_file.stem).strip("_") or "video"
 
     st.markdown("完成後下載選項")
 
-    if zip_data:
-        st.download_button(
-            label="下載影片+字幕.zip",
-            data=zip_data,
-            file_name=zip_name,
-            mime="application/zip",
-            use_container_width=True,
-            key=f"download_zip_{key_base}",
-        )
-        if subtitle_names:
-            st.caption(f"壓縮檔已包含影片與 {len(subtitle_names)} 個字幕檔。")
-        else:
-            st.caption("未偵測到字幕檔，壓縮檔目前僅包含影片。")
+    # Streamlit keeps download data in memory, so each button reads its files only when clicked.
+    st.download_button(
+        label="下載影片+字幕.zip",
+        data=lambda: build_video_subtitle_zip(bundled_files),
+        file_name=f"{output_file.stem}_bundle.zip",
+        mime="application/zip",
+        use_container_width=True,
+        key=f"download_zip_{key_base}",
+    )
+    if subtitle_files:
+        st.caption(f"壓縮檔已包含影片與 {len(subtitle_files)} 個字幕檔。")
     else:
-        st.button(
-            "下載影片+字幕.zip",
-            use_container_width=True,
-            disabled=True,
-            key=f"download_zip_disabled_{key_base}",
-        )
-        st.caption("目前無法建立影片+字幕壓縮檔。")
+        st.caption("未偵測到字幕檔，壓縮檔目前僅包含影片。")
 
     show_separate_key = f"show_separate_downloads_{key_base}"
     open_separate = st.button(
@@ -1195,7 +1193,7 @@ def render_final_download_actions(output_file: Path, is_cloud: bool) -> None:
     if st.session_state.get(show_separate_key, False):
         st.download_button(
             label=f"下載影片 ({output_file.name})",
-            data=output_file.read_bytes(),
+            data=output_file.read_bytes,
             file_name=output_file.name,
             mime="video/mp4",
             use_container_width=True,
@@ -1205,7 +1203,7 @@ def render_final_download_actions(output_file: Path, is_cloud: bool) -> None:
             for idx, subtitle_path in enumerate(subtitle_files, start=1):
                 st.download_button(
                     label=f"下載字幕 {idx}: {subtitle_path.name}",
-                    data=subtitle_path.read_bytes(),
+                    data=subtitle_path.read_bytes,
                     file_name=subtitle_path.name,
                     mime="text/plain",
                     use_container_width=True,
@@ -1216,7 +1214,7 @@ def render_final_download_actions(output_file: Path, is_cloud: bool) -> None:
 
     st.download_button(
         label="下載影片",
-        data=output_file.read_bytes(),
+        data=output_file.read_bytes,
         file_name=output_file.name,
         mime="video/mp4",
         use_container_width=True,
@@ -1237,7 +1235,6 @@ def main() -> None:
 
     st.session_state.setdefault("output_dir_raw", str(Path.cwd() / "downloads"))
     st.session_state.setdefault("task_logs", [])
-    st.session_state.setdefault("active_step", 1)
     st.session_state.setdefault("stage_progress", 0.0)
     st.session_state.setdefault("download_progress", 0.0)
     st.session_state.setdefault("last_status", "等待任務開始")
@@ -1249,10 +1246,6 @@ def main() -> None:
 
     with st.sidebar:
         st.markdown("## 任務設定")
-        work_mode = st.radio("作業模式", options=["單一連結", "批次連結"], index=0)
-        if work_mode == "批次連結":
-            st.caption("批次模式即將推出，現階段先使用單一連結流程。")
-
         login_url = st.text_input(
             "TronClass 登入網址",
             value="https://dstar.tronclass.com/login?next=/user/index#/",
@@ -1268,26 +1261,13 @@ def main() -> None:
             custom_name = st.text_input("自訂檔名", value="lesson_video")
 
         if is_cloud:
-            server_presets = get_server_output_presets()
-            _cur = st.session_state.get("output_dir_raw", server_presets[0] if server_presets else "")
-            _def_idx = server_presets.index(_cur) if _cur in server_presets else 0
-            selected_server_dir = st.selectbox(
-                "伺服器暫存目錄",
-                options=server_presets,
-                index=_def_idx,
-                key="server_output_dir_select",
-            )
-
-            st.text_input("下載資料夾", value=selected_server_dir, disabled=True, key="cloud_output_dir_display")
             st.caption("雲端模式：下載完成後請使用下方下載按鈕存到本機。")
-
-            output_dir_raw = selected_server_dir
+            output_dir_raw = ""
         else:
             output_dir_raw = st.text_input("下載資料夾", key="output_dir_raw")
 
         st.selectbox("輸出格式", options=["MP4"], index=0, disabled=True)
         retry_count = st.slider("重試次數", min_value=1, max_value=10, value=3)
-        save_in_server_dir = st.checkbox("另存至伺服器工作目錄", value=True)
 
         st.markdown("### 字幕設定")
         headless = st.checkbox("無頭模式", value=True)
@@ -1299,15 +1279,15 @@ def main() -> None:
             if ffmpeg_available:
                 st.info("macOS 已偵測到 ffmpeg，會使用最佳畫質流程；若勾選字幕嵌入，會直接封裝進 mp4。")
             else:
-                st.info("macOS 目前會走相容模式：仍可下載影片與外掛字幕檔，但不會做高畫質合併或字幕嵌入。")
+                st.info("macOS 目前會走相容模式：可下載外掛字幕檔，但只能下載有影音合一格式的影片，也不會做高畫質合併或字幕嵌入。")
         if not is_cloud and not ffmpeg_available:
             if sys.platform == "darwin":
                 st.warning(
-                    "未偵測到 ffmpeg。macOS 本機仍可下載，但會改用相容模式，只抓單一影片檔並略過字幕嵌入。若要最佳畫質或嵌入字幕，請先執行 brew install ffmpeg。下載完成後仍可用下方按鈕把影片與字幕存到本機。"
+                    "未偵測到 ffmpeg。會改用相容模式，只抓單一影片檔並略過字幕嵌入；沒有影音合一格式的影片會無法下載。若要下載這類影片、最佳畫質或嵌入字幕，請先執行 brew install ffmpeg。下載完成後仍可用下方按鈕把影片與字幕存到本機。"
                 )
             else:
                 st.warning(
-                    "未偵測到 ffmpeg。本機仍可下載，但會改用相容模式，只抓單一影片檔並略過字幕嵌入。若要最佳畫質或嵌入字幕，請先安裝 ffmpeg。"
+                    "未偵測到 ffmpeg。會改用相容模式，只抓單一影片檔並略過字幕嵌入；沒有影音合一格式的影片會無法下載。若要下載這類影片、最佳畫質或嵌入字幕，請先安裝 ffmpeg。"
                 )
             st.caption(f"ffmpeg 狀態：{ffmpeg_status}")
         subtitle_debug_mode = st.checkbox("除錯模式：顯示字幕軌", value=False)
@@ -1322,12 +1302,12 @@ def main() -> None:
 
     if clear_logs:
         st.session_state["task_logs"] = []
-        st.session_state["active_step"] = 1
         st.session_state["stage_progress"] = 0.0
         st.session_state["download_progress"] = 0.0
         st.session_state["last_status"] = "等待任務開始"
         st.session_state["health_status"] = ""
         st.session_state["health_message"] = "尚未執行健康檢查"
+        remove_cloud_output_dir(str(st.session_state.get("last_output_file", "")))
         st.session_state["last_output_file"] = ""
         for key in list(st.session_state.keys()):
             if isinstance(key, str) and key.startswith("show_separate_downloads_"):
@@ -1392,7 +1372,6 @@ def main() -> None:
                 current = int(step_match.group(1))
                 total = max(int(step_match.group(2)), 1)
                 stage_fraction = min(max(current / total, 0.0), 1.0)
-                st.session_state["active_step"] = min(max(current, 1), 4)
                 st.session_state["stage_progress"] = stage_fraction
                 self.stage_ui.progress(stage_fraction, text=f"流程進度: {int(stage_fraction * 100)}%")
             self.placeholder.markdown(
@@ -1421,19 +1400,17 @@ def main() -> None:
 
     output_dir_candidate = output_dir_raw.strip() if output_dir_raw.strip() else str(Path.cwd() / "downloads")
     output_dir = Path(output_dir_candidate).expanduser().resolve()
-    if save_in_server_dir and not output_dir_candidate:
-        output_dir = (Path.cwd() / "downloads").resolve()
 
     if start_download or inspect_only:
         if not all([login_url.strip(), username.strip(), password.strip(), video_page_url.strip()]):
             st.error("請填寫所有必填欄位。")
             return
 
-        st.session_state["active_step"] = 1
         st.session_state["stage_progress"] = 0.0
         st.session_state["download_progress"] = 0.0
         st.session_state["last_status"] = "任務啟動中..."
         append_task_log("任務啟動")
+        remove_stale_run_folders()
 
         status_ui = StatusBridge(status_placeholder, stage_progress_ui)
         progress_ui = DownloadProgressBridge(download_progress_ui)
@@ -1467,7 +1444,6 @@ def main() -> None:
                     unsafe_allow_html=True,
                 )
                 st.session_state["stage_progress"] = 1.0
-                st.session_state["active_step"] = 4
                 stage_progress_ui.progress(1.0, text="流程進度: 100%")
                 st.success("連結健康檢查完成，未下載影片。")
                 render_subtitle_debug_report(subtitle_debug_report)
@@ -1478,12 +1454,12 @@ def main() -> None:
                     health_panel_html(st.session_state["health_status"], st.session_state["health_message"]),
                     unsafe_allow_html=True,
                 )
-                output_file, has_available_subs, has_requested_subs, subtitle_debug_report = run_download(
+                output_file, has_available_subs, has_requested_subs, subtitle_debug_report, download_warning = run_download(
                     login_url=login_url.strip(),
                     username=username.strip(),
                     password=password,
                     video_page_url=video_page_url.strip(),
-                    output_dir=output_dir,
+                    output_dir=new_cloud_output_dir() if is_cloud else output_dir,
                     output_template=output_template,
                     headless=headless,
                     download_subtitles=download_subtitles,
@@ -1498,13 +1474,17 @@ def main() -> None:
 
                 progress_ui.progress(1.0, text="下載進度: 100%")
                 st.session_state["stage_progress"] = 1.0
-                st.session_state["active_step"] = 4
                 stage_progress_ui.progress(1.0, text="流程進度: 100%")
 
                 st.success(f"下載完成：{output_file}")
                 append_task_log(f"下載完成: {output_file}")
+                remove_cloud_output_dir(str(st.session_state.get("last_output_file", "")))
                 st.session_state["last_output_file"] = str(output_file)
                 render_final_download_actions(output_file, is_cloud)
+
+                if download_warning:
+                    append_task_log(download_warning)
+                    st.warning(download_warning)
 
                 if download_subtitles:
                     if has_requested_subs:
@@ -1528,11 +1508,12 @@ def main() -> None:
                 )
             st.error(error_message)
         except Exception as exc:
-            error_message = f"下載失敗：{exc}"
+            reason = describe_download_error(exc, ffmpeg_available)
+            error_message = f"下載失敗：{reason}"
             append_task_log(error_message)
             if inspect_only:
                 st.session_state["health_status"] = "red"
-                st.session_state["health_message"] = str(exc)
+                st.session_state["health_message"] = reason
                 health_placeholder.markdown(
                     health_panel_html(st.session_state["health_status"], st.session_state["health_message"]),
                     unsafe_allow_html=True,
