@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      APP_URL: https://tronclass-videocap.streamlit.app/
-      APP_HEALTH_URL: https://tronclass-videocap.streamlit.app/_stcore/health
-      LEGACY_SHARE_URL: https://share.streamlit.io/jackalcn/TronClassVideoCap/main/main.py
+      APP_URL: https://tronclass-video-downloader.streamlit.app/
+      APP_HEALTH_URL: https://tronclass-video-downloader.streamlit.app/_stcore/health
+      LEGACY_SHARE_URL: https://share.streamlit.io/jackalcn/TronClassVideoDownloader/main/main.py
 
     steps:
       - name: Check deployed Streamlit endpoints
@@ -75,12 +75,13 @@ jobs:
                   assert_share_entrypoint()
                   assert_redirect(app_url)
                   assert_redirect(app_health_url)
-                  print("Streamlit deployment health check passed")
-                  sys.exit(0)
-              except SystemExit as exc:
+              except (SystemExit, OSError) as exc:
                   last_error = str(exc)
                   print(f"retrying after probe failure: {last_error}")
                   time.sleep(15)
+              else:
+                  print("Streamlit deployment health check passed")
+                  sys.exit(0)
 
           raise SystemExit(last_error or "Streamlit deployment health check failed")
           PY
